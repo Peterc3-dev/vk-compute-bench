@@ -1,0 +1,15 @@
+[package]
+name = "vk-compute-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ash = "0.38"
+gpu-allocator = { version = "0.27", features = ["vulkan"] }
+bytemuck = { version = "1", features = ["derive"] }
+prettytable-rs = "0.10"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true

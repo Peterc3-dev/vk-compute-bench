@@ -1,0 +1,51 @@
+#version 450
+
+// Tiled matrix multiply: C = A * B
+// Each workgroup computes a TILE_SIZE x TILE_SIZE block of C
+
+#define TILE_SIZE 16
+
+layout(local_size_x = TILE_SIZE, local_size_y = TILE_SIZE) in;
+
+layout(set = 0, binding = 0) readonly buffer BufA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer BufB { float B[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float C[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+};
+
+shared float tileA[TILE_SIZE][TILE_SIZE];
+shared float tileB[TILE_SIZE][TILE_SIZE];
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint localRow = gl_LocalInvocationID.y;
+    uint localCol = gl_LocalInvocationID.x;
+
+    float sum = 0.0;
+    uint numTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (uint t = 0; t < numTiles; t++) {
+        uint tiledCol = t * TILE_SIZE + localCol;
+        uint tiledRow = t * TILE_SIZE + localRow;
+
+        tileA[localRow][localCol] = (row < M && tiledCol < K) ? A[row * K + tiledCol] : 0.0;
+        tileB[localRow][localCol] = (tiledRow < K && col < N) ? B[tiledRow * N + col] : 0.0;
+
+        barrier();
+
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += tileA[localRow][k] * tileB[k][localCol];
+        }
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
