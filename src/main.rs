@@ -62,6 +62,13 @@ struct VkContext {
     command_pool: vk::CommandPool,
     allocator: mem::ManuallyDrop<Allocator>,
     timestamp_period: f64, // nanoseconds per tick
+    subgroup_size: u32,
+    /// Optimal workgroup size for memory-bound (bandwidth) shaders
+    wg_bandwidth: u32,
+    /// Optimal workgroup size for compute-bound shaders
+    wg_compute: u32,
+    /// Max shared memory per workgroup (bytes)
+    max_shared_memory: u32,
 }
 
 struct Buffer {
@@ -123,6 +130,7 @@ impl VkContext {
                 .to_string_lossy()
                 .into_owned();
             let timestamp_period = props.limits.timestamp_period as f64;
+            let max_shared_memory = props.limits.max_compute_shared_memory_size;
 
             println!("Device: {}", device_name);
             println!(
@@ -130,6 +138,36 @@ impl VkContext {
                 vk::api_version_major(props.driver_version),
                 vk::api_version_minor(props.driver_version),
                 vk::api_version_patch(props.driver_version),
+            );
+
+            // ── Subgroup size detection (Vulkan 1.1) ──
+            let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
+            let mut props2 = vk::PhysicalDeviceProperties2::default()
+                .push_next(&mut subgroup_props);
+            instance.get_physical_device_properties2(physical_device, &mut props2);
+            let subgroup_size = subgroup_props.subgroup_size;
+
+            // Auto-tune workgroup sizes based on subgroup (wave) size
+            let (wg_bandwidth, wg_compute) = if subgroup_size >= 64 {
+                // Wave64 (RDNA 3+): 4 wavefronts for bandwidth, 2 for compute
+                (256u32, 128u32)
+            } else {
+                // Wave32 (older RDNA / NVIDIA): 4 wavefronts for bandwidth, 2 for compute
+                (128u32, 64u32)
+            };
+
+            println!(
+                "Subgroup size: {} (Wave{})",
+                subgroup_size,
+                subgroup_size,
+            );
+            println!(
+                "Workgroup auto-tune: bandwidth={}, compute={}",
+                wg_bandwidth, wg_compute,
+            );
+            println!(
+                "Max shared memory per workgroup: {} KB",
+                max_shared_memory / 1024,
             );
 
             // Queue family — compute
@@ -203,6 +241,10 @@ impl VkContext {
                 command_pool,
                 allocator: mem::ManuallyDrop::new(allocator),
                 timestamp_period,
+                subgroup_size,
+                wg_bandwidth,
+                wg_compute,
+                max_shared_memory,
             })
         }
     }
@@ -312,6 +354,16 @@ impl VkContext {
         descriptor_set_layout: vk::DescriptorSetLayout,
         push_constant_size: u32,
     ) -> (vk::Pipeline, vk::PipelineLayout) {
+        self.create_compute_pipeline_spec(spirv, descriptor_set_layout, push_constant_size, None)
+    }
+
+    fn create_compute_pipeline_spec(
+        &self,
+        spirv: &[u8],
+        descriptor_set_layout: vk::DescriptorSetLayout,
+        push_constant_size: u32,
+        workgroup_size: Option<u32>,
+    ) -> (vk::Pipeline, vk::PipelineLayout) {
         // Ensure alignment
         let spirv_u32: Vec<u32> = {
             assert!(spirv.len() % 4 == 0);
@@ -337,10 +389,32 @@ impl VkContext {
 
         let entry_name = unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") };
 
-        let stage_info = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(shader_module)
-            .name(entry_name);
+        // Specialization constant for workgroup size (constant_id = 0)
+        let spec_map_entry = vk::SpecializationMapEntry {
+            constant_id: 0,
+            offset: 0,
+            size: mem::size_of::<u32>(),
+        };
+        let wg = workgroup_size.unwrap_or(256u32);
+        let spec_data = wg.to_ne_bytes();
+        let spec_entries = [spec_map_entry];
+        let spec_info = vk::SpecializationInfo::default()
+            .map_entries(&spec_entries)
+            .data(&spec_data);
+
+        let stage_info = if workgroup_size.is_some() {
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(shader_module)
+                .name(entry_name)
+                .specialization_info(&spec_info)
+        } else {
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(shader_module)
+                .name(entry_name)
+                .specialization_info(&spec_info)
+        };
 
         let push_constant_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::COMPUTE,
@@ -545,10 +619,11 @@ fn bench_memory_bandwidth(ctx: &mut VkContext) -> Vec<BenchResult> {
 
     // ── Device-local copy (via compute shader) ──
     {
+        let wg = ctx.wg_bandwidth as usize;
         let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/copy.spv"));
         let ds_layout = ctx.create_descriptor_set_layout(2);
         let (pipeline, p_layout) =
-            ctx.create_compute_pipeline(spirv, ds_layout, mem::size_of::<CopyPush>() as u32);
+            ctx.create_compute_pipeline_spec(spirv, ds_layout, mem::size_of::<CopyPush>() as u32, Some(wg as u32));
         let pool = ctx.create_descriptor_pool(1, 2);
         let ds = ctx.allocate_descriptor_set(pool, ds_layout);
 
@@ -622,7 +697,7 @@ fn bench_memory_bandwidth(ctx: &mut VkContext) -> Vec<BenchResult> {
                 0,
                 bytemuck::bytes_of(&push),
             );
-            ctx.device.cmd_dispatch(cmd, ((n + 255) / 256) as u32, 1, 1);
+            ctx.device.cmd_dispatch(cmd, ((n + wg - 1) / wg) as u32, 1, 1);
             ctx.device.end_command_buffer(cmd).unwrap();
         }
         ctx.submit_and_wait(cmd);
@@ -652,7 +727,7 @@ fn bench_memory_bandwidth(ctx: &mut VkContext) -> Vec<BenchResult> {
                 0,
                 bytemuck::bytes_of(&push),
             );
-            ctx.device.cmd_dispatch(cmd, ((n + 255) / 256) as u32, 1, 1);
+            ctx.device.cmd_dispatch(cmd, ((n + wg - 1) / wg) as u32, 1, 1);
             ctx.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 1);
             ctx.device.end_command_buffer(cmd).unwrap();
         }
@@ -745,6 +820,7 @@ fn bench_memory_bandwidth(ctx: &mut VkContext) -> Vec<BenchResult> {
 }
 
 fn bench_saxpy(ctx: &mut VkContext) -> BenchResult {
+    let wg = ctx.wg_compute as usize;
     let n: usize = 16 * 1024 * 1024; // 16M elements
     let byte_size = (n * 4) as vk::DeviceSize;
     let size_mb = byte_size as f64 / (1024.0 * 1024.0);
@@ -752,7 +828,7 @@ fn bench_saxpy(ctx: &mut VkContext) -> BenchResult {
     let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/saxpy.spv"));
     let ds_layout = ctx.create_descriptor_set_layout(3);
     let (pipeline, p_layout) =
-        ctx.create_compute_pipeline(spirv, ds_layout, mem::size_of::<SaxpyPush>() as u32);
+        ctx.create_compute_pipeline_spec(spirv, ds_layout, mem::size_of::<SaxpyPush>() as u32, Some(wg as u32));
     let pool = ctx.create_descriptor_pool(1, 3);
     let ds = ctx.allocate_descriptor_set(pool, ds_layout);
 
@@ -769,7 +845,7 @@ fn bench_saxpy(ctx: &mut VkContext) -> BenchResult {
 
     let cmd = ctx.alloc_cmd();
     let qp = ctx.create_timestamp_query_pool(2);
-    let workgroups = ((n + 255) / 256) as u32;
+    let workgroups = ((n + wg - 1) / wg) as u32;
     let push = SaxpyPush {
         a: 2.5,
         n: n as u32,
@@ -863,6 +939,7 @@ fn bench_saxpy(ctx: &mut VkContext) -> BenchResult {
 }
 
 fn bench_reduction(ctx: &mut VkContext) -> BenchResult {
+    let wg = ctx.wg_compute as usize;
     let n: usize = 16 * 1024 * 1024;
     let byte_size = (n * 4) as vk::DeviceSize;
     let size_mb = byte_size as f64 / (1024.0 * 1024.0);
@@ -870,11 +947,11 @@ fn bench_reduction(ctx: &mut VkContext) -> BenchResult {
     let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/reduce.spv"));
     let ds_layout = ctx.create_descriptor_set_layout(2);
     let (pipeline, p_layout) =
-        ctx.create_compute_pipeline(spirv, ds_layout, mem::size_of::<ReducePush>() as u32);
+        ctx.create_compute_pipeline_spec(spirv, ds_layout, mem::size_of::<ReducePush>() as u32, Some(wg as u32));
     let pool = ctx.create_descriptor_pool(1, 2);
     let ds = ctx.allocate_descriptor_set(pool, ds_layout);
 
-    let workgroups = ((n + 255) / 256) as u32;
+    let workgroups = ((n + wg - 1) / wg) as u32;
     let out_size = (workgroups as usize * 4) as vk::DeviceSize;
 
     let mut buf_in = ctx.create_buffer(byte_size, MemoryLocation::CpuToGpu);

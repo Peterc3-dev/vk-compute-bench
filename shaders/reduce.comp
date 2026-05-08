@@ -1,6 +1,7 @@
 #version 450
 
-layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint WG_SIZE = 256;
+layout(local_size_x_id = 0) in;
 
 layout(set = 0, binding = 0) buffer BufIn  { float in_data[]; };
 layout(set = 0, binding = 1) buffer BufOut { float out_data[]; };
@@ -9,6 +10,7 @@ layout(push_constant) uniform PushConstants {
     uint n;
 };
 
+// Max possible workgroup size — only WG_SIZE elements are actually used
 shared float sdata[256];
 
 void main() {
@@ -18,7 +20,7 @@ void main() {
     sdata[tid] = (gid < n) ? in_data[gid] : 0.0;
     barrier();
 
-    for (uint s = 128; s > 0; s >>= 1) {
+    for (uint s = WG_SIZE >> 1; s > 0; s >>= 1) {
         if (tid < s) {
             sdata[tid] += sdata[tid + s];
         }
