@@ -1,6 +1,8 @@
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc};
+use gpu_allocator::vulkan::{
+    Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc,
+};
 use gpu_allocator::MemoryLocation;
 use prettytable::{row, Table};
 use rand::Rng;
@@ -49,6 +51,56 @@ struct BenchResult {
     peak_pct: Option<f64>,
 }
 
+// ── Pure metric helpers ────────────────────────────────────────────────
+//
+// These are the bits of arithmetic the benchmarks rely on, factored out of
+// the Vulkan call-sites so they can be unit-tested without a GPU.
+
+/// Reference device peaks for the target GPU (AMD Radeon 890M, RDNA 3.5).
+mod peak {
+    /// FP32 compute peak in GFLOPS (~8.6 TFLOPS).
+    pub const FP32_GFLOPS: f64 = 8600.0;
+    /// Memory bandwidth peak in GB/s (LPDDR5X-7500, ~89.6 GB/s).
+    pub const MEM_GBPS: f64 = 89.6;
+}
+
+/// Pick (bandwidth, compute) workgroup sizes from the device subgroup (wave)
+/// size. Wave64 parts (RDNA 3+) get larger groups; Wave32 parts get half.
+fn auto_tune_workgroups(subgroup_size: u32) -> (u32, u32) {
+    if subgroup_size >= 64 {
+        (256, 128)
+    } else {
+        (128, 64)
+    }
+}
+
+/// Number of workgroups needed to cover `n` items at `wg` items each.
+fn workgroup_count(n: usize, wg: usize) -> u32 {
+    n.div_ceil(wg) as u32
+}
+
+/// Effective bandwidth in GB/s for moving `bytes_moved` over `time_ms`.
+/// `bytes_moved` is the total traffic (e.g. read + write for a copy).
+fn bandwidth_gbps(bytes_moved: f64, time_ms: f64) -> f64 {
+    let mb = bytes_moved / (1024.0 * 1024.0);
+    (mb / (time_ms / 1000.0)) / 1024.0
+}
+
+/// Throughput in GFLOPS for `flops` floating-point ops over `time_ms`.
+fn gflops(flops: f64, time_ms: f64) -> f64 {
+    flops / (time_ms / 1000.0) / 1e9
+}
+
+/// Throughput in giga-elements/s for `elements` over `time_ms`.
+fn gelements_per_sec(elements: f64, time_ms: f64) -> f64 {
+    elements / (time_ms / 1000.0) / 1e9
+}
+
+/// Percentage of a theoretical peak (e.g. measured GFLOPS vs peak GFLOPS).
+fn percent_of_peak(measured: f64, peak: f64) -> f64 {
+    measured / peak * 100.0
+}
+
 // ── Vulkan context ─────────────────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -85,13 +137,12 @@ impl VkContext {
 
             // Instance
             let app_info = vk::ApplicationInfo::default()
-                .application_name(CStr::from_bytes_with_nul(b"vk-compute-bench\0").unwrap())
+                .application_name(c"vk-compute-bench")
                 .application_version(vk::make_api_version(0, 1, 0, 0))
-                .engine_name(CStr::from_bytes_with_nul(b"none\0").unwrap())
+                .engine_name(c"none")
                 .api_version(vk::make_api_version(0, 1, 1, 0));
 
-            let create_info = vk::InstanceCreateInfo::default()
-                .application_info(&app_info);
+            let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
 
             let instance = entry
                 .create_instance(&create_info, None)
@@ -115,13 +166,10 @@ impl VkContext {
                     props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
                 })
                 .or_else(|| {
-                    phys_devices
-                        .iter()
-                        .copied()
-                        .find(|&pd| {
-                            let props = instance.get_physical_device_properties(pd);
-                            props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
-                        })
+                    phys_devices.iter().copied().find(|&pd| {
+                        let props = instance.get_physical_device_properties(pd);
+                        props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
+                    })
                 })
                 .unwrap_or(phys_devices[0]);
 
@@ -142,25 +190,17 @@ impl VkContext {
 
             // ── Subgroup size detection (Vulkan 1.1) ──
             let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
-            let mut props2 = vk::PhysicalDeviceProperties2::default()
-                .push_next(&mut subgroup_props);
+            let mut props2 =
+                vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup_props);
             instance.get_physical_device_properties2(physical_device, &mut props2);
             let subgroup_size = subgroup_props.subgroup_size;
 
-            // Auto-tune workgroup sizes based on subgroup (wave) size
-            let (wg_bandwidth, wg_compute) = if subgroup_size >= 64 {
-                // Wave64 (RDNA 3+): 4 wavefronts for bandwidth, 2 for compute
-                (256u32, 128u32)
-            } else {
-                // Wave32 (older RDNA / NVIDIA): 4 wavefronts for bandwidth, 2 for compute
-                (128u32, 64u32)
-            };
+            // Auto-tune workgroup sizes based on subgroup (wave) size.
+            // Wave64 (RDNA 3+) gets larger groups; Wave32 (older RDNA /
+            // NVIDIA) gets half.
+            let (wg_bandwidth, wg_compute) = auto_tune_workgroups(subgroup_size);
 
-            println!(
-                "Subgroup size: {} (Wave{})",
-                subgroup_size,
-                subgroup_size,
-            );
+            println!("Subgroup size: {} (Wave{})", subgroup_size, subgroup_size,);
             println!(
                 "Workgroup auto-tune: bandwidth={}, compute={}",
                 wg_bandwidth, wg_compute,
@@ -218,8 +258,7 @@ impl VkContext {
             .map_err(|e| format!("Failed to create allocator: {:?}", e))?;
 
             // Print memory info
-            let mem_props =
-                instance.get_physical_device_memory_properties(physical_device);
+            let mem_props = instance.get_physical_device_memory_properties(physical_device);
             let mut device_local_mb = 0u64;
             for i in 0..mem_props.memory_heap_count {
                 let heap = mem_props.memory_heaps[i as usize];
@@ -259,9 +298,7 @@ impl VkContext {
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-        let buffer = unsafe {
-            self.device.create_buffer(&buffer_info, None).unwrap()
-        };
+        let buffer = unsafe { self.device.create_buffer(&buffer_info, None).unwrap() };
 
         let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
 
@@ -301,7 +338,7 @@ impl VkContext {
     fn upload_data<T: Pod>(&mut self, buf: &Buffer, data: &[T]) {
         let alloc = buf.allocation.as_ref().unwrap();
         let mapped = alloc.mapped_ptr().expect("Buffer not host-visible");
-        let byte_len = data.len() * mem::size_of::<T>();
+        let byte_len = mem::size_of_val(data);
         assert!(byte_len <= buf.size as usize);
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -334,11 +371,7 @@ impl VkContext {
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
 
-        unsafe {
-            self.device
-                .allocate_command_buffers(&alloc_info)
-                .unwrap()[0]
-        }
+        unsafe { self.device.allocate_command_buffers(&alloc_info).unwrap()[0] }
     }
 
     fn create_timestamp_query_pool(&self, count: u32) -> vk::QueryPool {
@@ -366,7 +399,7 @@ impl VkContext {
     ) -> (vk::Pipeline, vk::PipelineLayout) {
         // Ensure alignment
         let spirv_u32: Vec<u32> = {
-            assert!(spirv.len() % 4 == 0);
+            assert!(spirv.len().is_multiple_of(4));
             let mut v = vec![0u32; spirv.len() / 4];
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -378,8 +411,7 @@ impl VkContext {
             v
         };
 
-        let shader_module_create_info =
-            vk::ShaderModuleCreateInfo::default().code(&spirv_u32);
+        let shader_module_create_info = vk::ShaderModuleCreateInfo::default().code(&spirv_u32);
 
         let shader_module = unsafe {
             self.device
@@ -387,9 +419,12 @@ impl VkContext {
                 .unwrap()
         };
 
-        let entry_name = unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") };
+        let entry_name = c"main";
 
-        // Specialization constant for workgroup size (constant_id = 0)
+        // Specialization constant for workgroup size (constant_id = 0).
+        // Shaders that don't declare the constant simply ignore it, so the
+        // spec info is always supplied — falling back to a sensible default
+        // when no explicit size is requested.
         let spec_map_entry = vk::SpecializationMapEntry {
             constant_id: 0,
             offset: 0,
@@ -402,19 +437,11 @@ impl VkContext {
             .map_entries(&spec_entries)
             .data(&spec_data);
 
-        let stage_info = if workgroup_size.is_some() {
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(shader_module)
-                .name(entry_name)
-                .specialization_info(&spec_info)
-        } else {
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(shader_module)
-                .name(entry_name)
-                .specialization_info(&spec_info)
-        };
+        let stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader_module)
+            .name(entry_name)
+            .specialization_info(&spec_info);
 
         let push_constant_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::COMPUTE,
@@ -451,24 +478,18 @@ impl VkContext {
         (pipeline, pipeline_layout)
     }
 
-    fn create_descriptor_set_layout(
-        &self,
-        binding_count: u32,
-    ) -> vk::DescriptorSetLayout {
+    fn create_descriptor_set_layout(&self, binding_count: u32) -> vk::DescriptorSetLayout {
         let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..binding_count)
-            .map(|i| {
-                vk::DescriptorSetLayoutBinding {
-                    binding: i,
-                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-                    descriptor_count: 1,
-                    stage_flags: vk::ShaderStageFlags::COMPUTE,
-                    ..Default::default()
-                }
+            .map(|i| vk::DescriptorSetLayoutBinding {
+                binding: i,
+                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
             })
             .collect();
 
-        let layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
         unsafe {
             self.device
@@ -504,11 +525,7 @@ impl VkContext {
             .descriptor_pool(pool)
             .set_layouts(&layouts);
 
-        unsafe {
-            self.device
-                .allocate_descriptor_sets(&alloc_info)
-                .unwrap()[0]
-        }
+        unsafe { self.device.allocate_descriptor_sets(&alloc_info).unwrap()[0] }
     }
 
     fn update_descriptor_set(&self, set: vk::DescriptorSet, buffers: &[&Buffer]) {
@@ -582,15 +599,10 @@ impl VkContext {
         }
     }
 
-    fn cleanup_descriptors(
-        &self,
-        pool: vk::DescriptorPool,
-        set_layout: vk::DescriptorSetLayout,
-    ) {
+    fn cleanup_descriptors(&self, pool: vk::DescriptorPool, set_layout: vk::DescriptorSetLayout) {
         unsafe {
             self.device.destroy_descriptor_pool(pool, None);
-            self.device
-                .destroy_descriptor_set_layout(set_layout, None);
+            self.device.destroy_descriptor_set_layout(set_layout, None);
         }
     }
 }
@@ -622,8 +634,12 @@ fn bench_memory_bandwidth(ctx: &mut VkContext) -> Vec<BenchResult> {
         let wg = ctx.wg_bandwidth as usize;
         let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/copy.spv"));
         let ds_layout = ctx.create_descriptor_set_layout(2);
-        let (pipeline, p_layout) =
-            ctx.create_compute_pipeline_spec(spirv, ds_layout, mem::size_of::<CopyPush>() as u32, Some(wg as u32));
+        let (pipeline, p_layout) = ctx.create_compute_pipeline_spec(
+            spirv,
+            ds_layout,
+            mem::size_of::<CopyPush>() as u32,
+            Some(wg as u32),
+        );
         let pool = ctx.create_descriptor_pool(1, 2);
         let ds = ctx.allocate_descriptor_set(pool, ds_layout);
 
@@ -655,16 +671,30 @@ fn bench_memory_bandwidth(ctx: &mut VkContext) -> Vec<BenchResult> {
                             .bind_buffer_memory(vk_buf, alloc.memory(), alloc.offset())
                             .unwrap();
                     }
-                    (Buffer { buffer: vk_buf, allocation: Some(alloc), size: byte_size }, true)
+                    (
+                        Buffer {
+                            buffer: vk_buf,
+                            allocation: Some(alloc),
+                            size: byte_size,
+                        },
+                        true,
+                    )
                 }
                 Err(_) => {
-                    unsafe { ctx.device.destroy_buffer(vk_buf, None); }
-                    (ctx.create_buffer(byte_size, MemoryLocation::CpuToGpu), false)
+                    unsafe {
+                        ctx.device.destroy_buffer(vk_buf, None);
+                    }
+                    (
+                        ctx.create_buffer(byte_size, MemoryLocation::CpuToGpu),
+                        false,
+                    )
                 }
             }
         };
         if !dst_is_device_local {
-            println!("  [note] GpuOnly alloc failed; dst buffer using CpuToGpu (UMA shared memory)");
+            println!(
+                "  [note] GpuOnly alloc failed; dst buffer using CpuToGpu (UMA shared memory)"
+            );
         }
 
         // Fill source
@@ -680,7 +710,8 @@ fn bench_memory_bandwidth(ctx: &mut VkContext) -> Vec<BenchResult> {
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             ctx.device.begin_command_buffer(cmd, &begin).unwrap();
-            ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            ctx.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             ctx.device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
@@ -697,20 +728,24 @@ fn bench_memory_bandwidth(ctx: &mut VkContext) -> Vec<BenchResult> {
                 0,
                 bytemuck::bytes_of(&push),
             );
-            ctx.device.cmd_dispatch(cmd, ((n + wg - 1) / wg) as u32, 1, 1);
+            ctx.device.cmd_dispatch(cmd, workgroup_count(n, wg), 1, 1);
             ctx.device.end_command_buffer(cmd).unwrap();
         }
         ctx.submit_and_wait(cmd);
 
         // Timed run
         unsafe {
-            ctx.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
+            ctx.device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                .unwrap();
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             ctx.device.begin_command_buffer(cmd, &begin).unwrap();
             ctx.device.cmd_reset_query_pool(cmd, qp, 0, 2);
-            ctx.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, qp, 0);
-            ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            ctx.device
+                .cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, qp, 0);
+            ctx.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             ctx.device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
@@ -727,16 +762,17 @@ fn bench_memory_bandwidth(ctx: &mut VkContext) -> Vec<BenchResult> {
                 0,
                 bytemuck::bytes_of(&push),
             );
-            ctx.device.cmd_dispatch(cmd, ((n + wg - 1) / wg) as u32, 1, 1);
-            ctx.device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 1);
+            ctx.device.cmd_dispatch(cmd, workgroup_count(n, wg), 1, 1);
+            ctx.device
+                .cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, qp, 1);
             ctx.device.end_command_buffer(cmd).unwrap();
         }
         ctx.submit_and_wait(cmd);
 
         let ts = ctx.get_timestamps(qp, 0, 2);
         let ms = ctx.ticks_to_ms(ts[1].wrapping_sub(ts[0]));
-        // Read + write = 2x
-        let bw = (2.0 * size_mb) / (ms / 1000.0) / 1024.0; // GB/s
+        // Read + write = 2x the buffer size of traffic.
+        let bw = bandwidth_gbps(2.0 * byte_size as f64, ms);
 
         let copy_name = if dst_is_device_local {
             "Memory: Buffer Copy (compute, device-local)"
@@ -751,7 +787,7 @@ fn bench_memory_bandwidth(ctx: &mut VkContext) -> Vec<BenchResult> {
             metric_val: bw,
             // Peak% only meaningful when dst is truly device-local VRAM
             peak_pct: if dst_is_device_local {
-                Some(bw / 89.6 * 100.0) // 890M theoretical ~89.6 GB/s
+                Some(percent_of_peak(bw, peak::MEM_GBPS))
             } else {
                 None
             },
@@ -777,7 +813,7 @@ fn bench_memory_bandwidth(ctx: &mut VkContext) -> Vec<BenchResult> {
             ctx.upload_data(&buf, &data);
         }
         let elapsed = start.elapsed().as_secs_f64() * 1000.0 / 10.0;
-        let bw = size_mb / (elapsed / 1000.0) / 1024.0;
+        let bw = bandwidth_gbps(byte_size as f64, elapsed);
 
         results.push(BenchResult {
             name: "Memory: Host->Device write".into(),
@@ -802,7 +838,7 @@ fn bench_memory_bandwidth(ctx: &mut VkContext) -> Vec<BenchResult> {
             let _v: Vec<f32> = ctx.download_data(&buf, n);
         }
         let elapsed = start.elapsed().as_secs_f64() * 1000.0 / 10.0;
-        let bw = size_mb / (elapsed / 1000.0) / 1024.0;
+        let bw = bandwidth_gbps(byte_size as f64, elapsed);
 
         results.push(BenchResult {
             name: "Memory: Device->Host read".into(),
@@ -827,8 +863,12 @@ fn bench_saxpy(ctx: &mut VkContext) -> BenchResult {
 
     let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/saxpy.spv"));
     let ds_layout = ctx.create_descriptor_set_layout(3);
-    let (pipeline, p_layout) =
-        ctx.create_compute_pipeline_spec(spirv, ds_layout, mem::size_of::<SaxpyPush>() as u32, Some(wg as u32));
+    let (pipeline, p_layout) = ctx.create_compute_pipeline_spec(
+        spirv,
+        ds_layout,
+        mem::size_of::<SaxpyPush>() as u32,
+        Some(wg as u32),
+    );
     let pool = ctx.create_descriptor_pool(1, 3);
     let ds = ctx.allocate_descriptor_set(pool, ds_layout);
 
@@ -845,7 +885,7 @@ fn bench_saxpy(ctx: &mut VkContext) -> BenchResult {
 
     let cmd = ctx.alloc_cmd();
     let qp = ctx.create_timestamp_query_pool(2);
-    let workgroups = ((n + wg - 1) / wg) as u32;
+    let workgroups = workgroup_count(n, wg);
     let push = SaxpyPush {
         a: 2.5,
         n: n as u32,
@@ -856,7 +896,8 @@ fn bench_saxpy(ctx: &mut VkContext) -> BenchResult {
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         ctx.device.begin_command_buffer(cmd, &begin).unwrap();
-        ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        ctx.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
         ctx.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -888,7 +929,8 @@ fn bench_saxpy(ctx: &mut VkContext) -> BenchResult {
         ctx.device.cmd_reset_query_pool(cmd, qp, 0, 2);
         ctx.device
             .cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, qp, 0);
-        ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        ctx.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
         ctx.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -914,9 +956,8 @@ fn bench_saxpy(ctx: &mut VkContext) -> BenchResult {
     let ts = ctx.get_timestamps(qp, 0, 2);
     let ms = ctx.ticks_to_ms(ts[1].wrapping_sub(ts[0]));
     // SAXPY: 2 FLOPs per element (multiply + add)
-    let gflops = (2.0 * n as f64) / (ms / 1000.0) / 1e9;
-    // Radeon 890M theoretical FP32 ~8.6 TFLOPS
-    let peak_pct = gflops / 8600.0 * 100.0;
+    let gflops_val = gflops(2.0 * n as f64, ms);
+    let peak_pct = percent_of_peak(gflops_val, peak::FP32_GFLOPS);
 
     unsafe {
         ctx.device.destroy_query_pool(qp, None);
@@ -933,7 +974,7 @@ fn bench_saxpy(ctx: &mut VkContext) -> BenchResult {
         size_mb: size_mb * 3.0,
         time_ms: ms,
         metric: "GFLOPS".into(),
-        metric_val: gflops,
+        metric_val: gflops_val,
         peak_pct: Some(peak_pct),
     }
 }
@@ -946,12 +987,16 @@ fn bench_reduction(ctx: &mut VkContext) -> BenchResult {
 
     let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/reduce.spv"));
     let ds_layout = ctx.create_descriptor_set_layout(2);
-    let (pipeline, p_layout) =
-        ctx.create_compute_pipeline_spec(spirv, ds_layout, mem::size_of::<ReducePush>() as u32, Some(wg as u32));
+    let (pipeline, p_layout) = ctx.create_compute_pipeline_spec(
+        spirv,
+        ds_layout,
+        mem::size_of::<ReducePush>() as u32,
+        Some(wg as u32),
+    );
     let pool = ctx.create_descriptor_pool(1, 2);
     let ds = ctx.allocate_descriptor_set(pool, ds_layout);
 
-    let workgroups = ((n + wg - 1) / wg) as u32;
+    let workgroups = workgroup_count(n, wg);
     let out_size = (workgroups as usize * 4) as vk::DeviceSize;
 
     let mut buf_in = ctx.create_buffer(byte_size, MemoryLocation::CpuToGpu);
@@ -970,7 +1015,8 @@ fn bench_reduction(ctx: &mut VkContext) -> BenchResult {
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         ctx.device.begin_command_buffer(cmd, &begin).unwrap();
-        ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        ctx.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
         ctx.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -1002,7 +1048,8 @@ fn bench_reduction(ctx: &mut VkContext) -> BenchResult {
         ctx.device.cmd_reset_query_pool(cmd, qp, 0, 2);
         ctx.device
             .cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, qp, 0);
-        ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        ctx.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
         ctx.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -1028,7 +1075,7 @@ fn bench_reduction(ctx: &mut VkContext) -> BenchResult {
     let ts = ctx.get_timestamps(qp, 0, 2);
     let ms = ctx.ticks_to_ms(ts[1].wrapping_sub(ts[0]));
     // Reduction: n-1 additions, effectively n elements processed
-    let gelements_s = (n as f64) / (ms / 1000.0) / 1e9;
+    let gelements_s = gelements_per_sec(n as f64, ms);
 
     unsafe {
         ctx.device.destroy_query_pool(qp, None);
@@ -1084,15 +1131,16 @@ fn bench_matmul(ctx: &mut VkContext) -> BenchResult {
     let qp = ctx.create_timestamp_query_pool(2);
     let push = MatmulPush { m, n, k };
 
-    let wg_x = (n + 15) / 16;
-    let wg_y = (m + 15) / 16;
+    let wg_x = n.div_ceil(16);
+    let wg_y = m.div_ceil(16);
 
     // Warmup
     unsafe {
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         ctx.device.begin_command_buffer(cmd, &begin).unwrap();
-        ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        ctx.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
         ctx.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -1124,7 +1172,8 @@ fn bench_matmul(ctx: &mut VkContext) -> BenchResult {
         ctx.device.cmd_reset_query_pool(cmd, qp, 0, 2);
         ctx.device
             .cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, qp, 0);
-        ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        ctx.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
         ctx.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -1151,8 +1200,8 @@ fn bench_matmul(ctx: &mut VkContext) -> BenchResult {
     let ms = ctx.ticks_to_ms(ts[1].wrapping_sub(ts[0]));
     // Matmul FLOPs: 2*M*N*K (multiply + accumulate per output element)
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
-    let gflops = flops / (ms / 1000.0) / 1e9;
-    let peak_pct = gflops / 8600.0 * 100.0;
+    let gflops_val = gflops(flops, ms);
+    let peak_pct = percent_of_peak(gflops_val, peak::FP32_GFLOPS);
 
     unsafe {
         ctx.device.destroy_query_pool(qp, None);
@@ -1169,7 +1218,7 @@ fn bench_matmul(ctx: &mut VkContext) -> BenchResult {
         size_mb: total_mb,
         time_ms: ms,
         metric: "GFLOPS".into(),
-        metric_val: gflops,
+        metric_val: gflops_val,
         peak_pct: Some(peak_pct),
     }
 }
@@ -1245,4 +1294,70 @@ fn main() {
     table.printstd();
     println!();
     println!("Peak references: FP32 ~8.6 TFLOPS, Memory BW ~89.6 GB/s (LPDDR5X-7500)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-6, "expected {b}, got {a}");
+    }
+
+    #[test]
+    fn auto_tune_picks_wave64_sizes() {
+        // RDNA 3+ reports a 64-lane wave.
+        assert_eq!(auto_tune_workgroups(64), (256, 128));
+        // Some drivers report a larger preferred size.
+        assert_eq!(auto_tune_workgroups(128), (256, 128));
+    }
+
+    #[test]
+    fn auto_tune_picks_wave32_sizes() {
+        assert_eq!(auto_tune_workgroups(32), (128, 64));
+        // Degenerate/unknown subgroup size still falls into the small path.
+        assert_eq!(auto_tune_workgroups(0), (128, 64));
+    }
+
+    #[test]
+    fn workgroup_count_rounds_up() {
+        // Exact multiple.
+        assert_eq!(workgroup_count(256, 256), 1);
+        assert_eq!(workgroup_count(512, 256), 2);
+        // Non-multiple rounds up so every element is covered.
+        assert_eq!(workgroup_count(257, 256), 2);
+        assert_eq!(workgroup_count(1, 256), 1);
+        assert_eq!(workgroup_count(0, 256), 0);
+    }
+
+    #[test]
+    fn bandwidth_is_gibibytes_per_second() {
+        // 1 GiB moved in exactly 1000 ms == 1 GiB/s.
+        let one_gib = 1024.0 * 1024.0 * 1024.0;
+        approx(bandwidth_gbps(one_gib, 1000.0), 1.0);
+        // Halving the time doubles the bandwidth.
+        approx(bandwidth_gbps(one_gib, 500.0), 2.0);
+    }
+
+    #[test]
+    fn gflops_scales_inversely_with_time() {
+        // 1e9 FLOPs in 1000 ms == 1 GFLOPS.
+        approx(gflops(1e9, 1000.0), 1.0);
+        // 2e9 FLOPs in 1000 ms == 2 GFLOPS.
+        approx(gflops(2e9, 1000.0), 2.0);
+    }
+
+    #[test]
+    fn gelements_per_sec_basic() {
+        // 1e9 elements in 1000 ms == 1 GElem/s.
+        approx(gelements_per_sec(1e9, 1000.0), 1.0);
+        approx(gelements_per_sec(5e8, 1000.0), 0.5);
+    }
+
+    #[test]
+    fn percent_of_peak_math() {
+        approx(percent_of_peak(43.0, 86.0), 50.0);
+        approx(percent_of_peak(peak::FP32_GFLOPS, peak::FP32_GFLOPS), 100.0);
+        approx(percent_of_peak(0.0, peak::MEM_GBPS), 0.0);
+    }
 }
